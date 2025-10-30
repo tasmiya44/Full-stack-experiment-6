@@ -1,0 +1,109 @@
+// middleware/logger.js
+function logger(req, res, next) {
+  const now = new Date();
+  console.log(`[${now.toISOString()}] ${req.method} ${req.url}`);
+  next(); // move to next middleware or route
+}
+
+module.exports = logger;
+// middleware/auth.js
+function auth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Unauthorized: Token missing or invalid' });
+  }
+
+  const token = authHeader.split(' ')[1]; // extract token
+  
+  // Example token verification
+  if (token !== process.env.SECRET_TOKEN) {
+    return res.status(403).json({ message: 'Forbidden: Invalid token' });
+  }
+
+  next(); // token is valid → continue to next handler
+}
+
+module.exports = auth;
+// routes/userRoutes.js
+const express = require('express');
+const router = express.Router();
+
+// Example route
+router.get('/profile', (req, res) => {
+  res.json({ user: 'Major', role: 'Admin', message: 'Access granted' });
+});
+
+module.exports = router;
+const express = require('express');
+const dotenv = require('dotenv');
+const logger = require('./middleware/logger');
+const auth = require('./middleware/auth');
+const userRoutes = require('./routes/userRoutes');
+
+dotenv.config();
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// Global middleware
+app.use(express.json());
+app.use(logger);
+
+// Protected routes with auth middleware
+app.use('/api/users', auth, userRoutes);
+
+app.get('/', (req, res) => {
+  res.send('Middleware Demo API Running...');
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
+{
+  "message": "Unauthorized: Token missing or invalid"
+}
+{
+  "user": "Major",
+  "role": "Admin",
+  "message": "Access granted"
+}
+// server.js
+const express = require('express');
+const dotenv = require('dotenv');
+dotenv.config();
+
+const app = express();
+app.use(express.json());
+
+// Logger middleware
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// Auth middleware
+app.use('/api', (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Unauthorized: Token missing or invalid' });
+  }
+  const token = authHeader.split(' ')[1];
+  if (token !== process.env.SECRET_TOKEN) {
+    return res.status(403).json({ message: 'Forbidden: Invalid token' });
+  }
+  next();
+});
+
+// Routes
+app.get('/api/users/profile', (req, res) => {
+  res.json({ user: 'Major', role: 'Admin', message: 'Access granted' });
+});
+
+app.get('/', (req, res) => {
+  res.send('Middleware Demo API Running...');
+});
+
+// Server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
