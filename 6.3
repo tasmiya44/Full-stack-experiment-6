@@ -1,0 +1,215 @@
+// models/User.js
+const mongoose = require('mongoose');
+
+const UserSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  name: String,
+  balance: { type: Number, default: 0 }, // use integer cents in production
+  // optional: version field for optimistic concurrency (not required for $inc approach)
+  updatedAt: { type: Date, default: Date.now }
+});
+
+module.exports = mongoose.model('User', UserSchema);
+// models/Ledger.js
+const mongoose = require('mongoose');
+
+const LedgerSchema = new mongoose.Schema({
+  idempotencyKey: { type: String, required: true, index: true, unique: true },
+  from: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  to: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  amount: { type: Number, required: true }, // integer cents
+  status: { type: String, enum: ['pending','debited','credited','completed','failed','compensated'], default: 'pending' },
+  failureReason: { type: String },
+  attempts: { type: Number, default: 0 },
+  meta: { type: Object, default: {} },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
+});
+
+LedgerSchema.pre('save', function(next){
+  this.updatedAt = new Date();
+  next();
+});
+
+module.exports = mongoose.model('Ledger', LedgerSchema);
+// routes/transfer.js
+const express = require('express');
+const mongoose = require('mongoose');
+const User = require('../models/User');
+const Ledger = require('../models/Ledger');
+
+const router = express.Router();
+
+// Helper: sleep for exponential backoff on retries (optional)
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+/**
+ * POST /api/transfer
+ * Body: { fromId, toEmail (or toId), amountCents, idempotencyKey }
+ */
+router.post('/', async (req, res) => {
+  try {
+    const { fromId, toEmail, toId, amountCents, idempotencyKey, meta } = req.body;
+
+    // Basic validation
+    if (!idempotencyKey) return res.status(400).json({ message: 'idempotencyKey required' });
+    if (!fromId) return res.status(400).json({ message: 'fromId required' });
+    if (!amountCents || amountCents <= 0) return res.status(400).json({ message: 'amountCents must be > 0' });
+    if (!toEmail && !toId) return res.status(400).json({ message: 'toEmail or toId required' });
+
+    // Resolve recipient by email if provided
+    let to;
+    if (toId) {
+      to = await User.findById(toId);
+      if (!to) return res.status(404).json({ message: 'Recipient not found' });
+    } else {
+      to = await User.findOne({ email: toEmail });
+      if (!to) return res.status(404).json({ message: 'Recipient not found' });
+    }
+
+    // Idempotency: create ledger document if not exists
+    let ledger;
+    try {
+      ledger = await Ledger.create({
+        idempotencyKey,
+        from: mongoose.Types.ObjectId(fromId),
+        to: to._id,
+        amount: amountCents,
+        status: 'pending',
+        meta: meta || {}
+      });
+    } catch (err) {
+      // If duplicate key error, ledger already exists — fetch it
+      if (err.code === 11000) {
+        ledger = await Ledger.findOne({ idempotencyKey });
+        // If the ledger is already completed, return outcome
+        if (['completed','credited'].includes(ledger.status)) {
+          return res.status(200).json({ message: 'Already completed', ledger });
+        }
+        // otherwise we'll resume or retry based on current ledger.status
+      } else {
+        throw err;
+      }
+    }
+
+    // If ledger already marked completed -> return
+    if (['completed','credited'].includes(ledger.status)) {
+      return res.status(200).json({ message: 'Already completed', ledger });
+    }
+
+    // Step 1: Atomic debit of sender (prevents negative balance)
+    // Use conditional update: ensure balance >= amount
+    const debitResult = await User.updateOne(
+      { _id: ledger.from, balance: { $gte: amountCents } },
+      { $inc: { balance: -amountCents }, $set: { updatedAt: new Date() } }
+    );
+
+    if (debitResult.modifiedCount === 0) {
+      // Debit failed - likely insufficient funds or user missing
+      ledger.status = 'failed';
+      ledger.failureReason = 'Insufficient funds or sender not found';
+      ledger.attempts = (ledger.attempts || 0) + 1;
+      await ledger.save();
+      return res.status(400).json({ message: 'Insufficient funds or sender not found', ledger });
+    }
+
+    // Mark ledger as debited
+    ledger.status = 'debited';
+    ledger.attempts = (ledger.attempts || 0) + 1;
+    await ledger.save();
+
+    // Step 2: Credit recipient
+    // Attempt to credit recipient; handle unexpected failures by compensation
+    let creditSucceeded = false;
+    try {
+      const creditResult = await User.updateOne(
+        { _id: ledger.to },
+        { $inc: { balance: amountCents }, $set: { updatedAt: new Date() } }
+      );
+
+      if (creditResult.matchedCount === 0) {
+        // Recipient disappeared unexpectedly
+        throw new Error('Recipient not found during credit');
+      }
+
+      creditSucceeded = true;
+      ledger.status = 'credited';
+      await ledger.save();
+
+      // Finalize
+      ledger.status = 'completed';
+      await ledger.save();
+
+      return res.status(200).json({ message: 'Transfer completed', ledger });
+    } catch (creditErr) {
+      // Credit failed — need to compensate (refund sender)
+      console.error('Credit failed, attempting compensation', creditErr);
+
+      // Try compensating: credit sender back
+      let compensated = false;
+      try {
+        // We do compensation in a loop with limited retries (exponential backoff)
+        const maxCompAttempts = 3;
+        for (let attempt = 1; attempt <= maxCompAttempts; attempt++) {
+          const compResult = await User.updateOne(
+            { _id: ledger.from },
+            { $inc: { balance: amountCents }, $set: { updatedAt: new Date() } }
+          );
+          if (compResult.modifiedCount === 1) {
+            compensated = true;
+            break;
+          }
+          // wait then retry
+          await sleep(100 * attempt);
+        }
+      } catch (compErr) {
+        console.error('Compensation attempt threw error', compErr);
+      }
+
+      ledger.status = compensated ? 'compensated' : 'failed';
+      ledger.failureReason = `Credit failed: ${creditErr.message}. compensationSucceeded=${compensated}`;
+      await ledger.save();
+
+      // If compensation failed, raise an alert for ops (log, push notification, etc.)
+      if (!compensated) {
+        // In production: push to alerting system or create a high-priority "repair" queue
+        console.error('CRITICAL: Compensation failed for ledger', ledger._id.toString());
+      }
+
+      return res.status(500).json({
+        message: 'Transfer failed, compensation ' + (compensated ? 'applied' : 'failed'),
+        ledger
+      });
+    }
+  } catch (err) {
+    console.error('Unhandled error in /transfer', err);
+    return res.status(500).json({ message: 'Internal server error', error: err.message });
+  }
+});
+
+module.exports = router;
+// app.js
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const bodyParser = require('body-parser');
+
+const transferRouter = require('./routes/transfer');
+
+const app = express();
+app.use(bodyParser.json());
+
+app.use('/api/transfer', transferRouter);
+
+// Basic error handler
+app.use((err, req, res, next) => {
+  console.error('global error', err);
+  res.status(500).json({ message: 'Internal server error' });
+});
+
+async function start() {
+  await mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/bankapp');
+  const port = process.env.PORT || 4000;
+  app.listen(port, () => console.log('Server listening on', port));
+}
+start().catch(err => { console.error(err); process.exit(1); });
